@@ -129,9 +129,10 @@ struct Inner {
     registry: Registry,
     /// Keyed by expansion source, then by viewer and placeholder.
     cache: ExpansionCache,
-    /// Moves on every register and unregister, so an answer in flight across
-    /// one is not cached under a registration it was not given for. One counter
-    /// for everything: a change anywhere only costs the answers in flight their
+    /// Moves on every register, unregister and refused ask, so an answer in
+    /// flight across one is not cached: it may belong to an old registration,
+    /// or hold a placeholder that was left as written. One counter for
+    /// everything: a change anywhere only costs the answers in flight their
     /// cache entry.
     generation: u64,
     /// What each call chain has left, by chain id.
@@ -203,12 +204,17 @@ pub(crate) struct Pending<'a> {
 }
 
 impl Pending<'_> {
-    /// Caches the answer if the expansion asked for a TTL and no expansion
-    /// registered or left while it was asked.
+    /// Caches the answer if the expansion asked for a TTL and nothing moved
+    /// while it was asked: no registration, no refused ask, and no answer to a
+    /// later ask for the same placeholder.
     pub(crate) fn store(self, value: Option<String>) -> Result<(), Busy> {
         let ttl = self.expansion.ttl_ms();
         self.state.with(|inner| {
-            if ttl == 0 || inner.generation != self.generation {
+            let newer = inner
+                .cache
+                .get(&self.key)
+                .is_some_and(|entry| entry.stored > self.asked);
+            if ttl == 0 || inner.generation != self.generation || newer {
                 return;
             }
             cache_insert(
@@ -345,6 +351,8 @@ impl State {
                 None => Some(Refusal::Budget),
             };
             if let Some(why) = why {
+                // An answer in flight may now hold this placeholder as written.
+                inner.generation += 1;
                 return Lookup::Refused {
                     source: expansion.source,
                     why,

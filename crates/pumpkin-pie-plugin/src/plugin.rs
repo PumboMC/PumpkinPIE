@@ -205,7 +205,7 @@ fn resolve_one(
     )?;
     let value = ask_expansion(ipc, &pending.expansion.source, &request);
     // The state decides whether the answer may still be cached: the expansion
-    // may have registered again meanwhile.
+    // may have registered again, or an ask may have been refused meanwhile.
     if pending.store(value.clone()).is_err() {
         busy(id);
     }
@@ -729,6 +729,49 @@ mod tests {
             "{} asks",
             exp.asks.get()
         );
+    }
+
+    /// An answer built while a nested ask was refused still holds that
+    /// placeholder as written. Before, it was cached for the whole TTL.
+    #[test]
+    fn an_answer_built_around_a_refused_ask_is_not_cached() {
+        let state = State::default();
+        let on_request = |exp: &Exp<'_>| Some(text_of(exp.call(set_placeholders("<%exp_loop%>"))));
+        let exp = Exp::new(&state, &on_request);
+        register_as(&exp, Cache::Ttl { ms: 60_000 });
+
+        let first = resolve(&exp, "%exp_loop%");
+        let asks = exp.asks.get();
+        assert_eq!(resolve(&exp, "%exp_loop%"), first);
+        assert_eq!(exp.asks.get(), 2 * asks, "the second line asked again");
+    }
+
+    /// Two callers miss the same placeholder and the later one is answered
+    /// first. Before, the older answer arrived last and replaced it.
+    #[test]
+    fn an_older_answer_does_not_replace_a_newer_one() {
+        let state = State::default();
+        let asked = Cell::new(0);
+        let on_request = |exp: &Exp<'_>| {
+            asked.set(asked.get() + 1);
+            if asked.get() > 1 {
+                return Some("new".to_string());
+            }
+            let line = text_of(handle(
+                exp.state,
+                exp,
+                "Scoreboard",
+                set_placeholders("%exp_rank%"),
+            ));
+            assert_eq!(line, "new");
+            Some("old".to_string())
+        };
+        let exp = Exp::new(&state, &on_request);
+        register_as(&exp, Cache::Ttl { ms: 60_000 });
+
+        assert_eq!(resolve(&exp, "%exp_rank%"), "old");
+        assert_eq!(resolve(&exp, "%exp_rank%"), "new");
+        assert_eq!(asked.get(), 2, "the newer answer came from the cache");
     }
 
     /// Before, each warning was logged once for the plugin's whole life and
