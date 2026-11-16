@@ -237,6 +237,8 @@ What that costs you today:
   within the same call chain, up to 64 nested calls, and then trap the plugin that makes the next
   one. When an expansion calls back while the provider waits on it, the provider allows four such
   asks waiting at once and 16 asks per line in all, and leaves the placeholder as written past
-  either limit.
+  either limit, or once 16 asks are waiting across the server. It tells a call back only by its
+  sender: under the concurrent v0.2 API, any call from an expansion it is waiting on counts as one
+  and joins the newest line waiting on it. Exact tracking needs a caller id from the host.
 
 [ipc]: https://github.com/Pumpkin-MC/Pumpkin/blob/master/crates/pumpkin-plugin-wit/v0.1/ipc.wit

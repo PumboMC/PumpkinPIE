@@ -282,7 +282,13 @@ synchronously, from inside its own IPC handler, so calling back re-enters it whi
 inside the call that invoked you. Pumpkin 0.2.0 to 0.2.2 allow that within one call chain up to 64
 nested calls, and then trap the plugin that makes the next one. The provider allows four asks
 waiting on calls back like yours and 16 asks per line in all, and leaves the placeholder as
-written past either limit.
+written past either limit, or once 16 asks are waiting across the server.
+
+The provider can only tell a call back by who sends it. Under the concurrent v0.2 API, any call
+from your plugin while the provider waits on it counts as one: a tab list plugin asked for
+`%tab_x%` while it sends its own 40-line batch gets the 15 asks left on the line that asked it, so
+most of the batch stays as written. When two lines wait on your plugin at once, a call back joins
+the newer one. Telling them apart exactly needs a caller id from the host.
 
 The same applies to messaging **any other plugin** from inside the closure. It runs on the caller's
 thread inside their critical path, so a slow closure stalls every consumer on the server. Keep it to
