@@ -202,7 +202,9 @@ pub(crate) struct Chain<'a> {
 impl Drop for Chain<'_> {
     fn drop(&mut self) {
         if !self.nested {
-            let _ = self.state.with(|inner| inner.chains.remove(&self.id));
+            let ended = self.state.with(|inner| inner.chains.remove(&self.id));
+            // Nothing runs under the lock that could yield or call out, so it is free here.
+            debug_assert!(ended.is_ok(), "provider state locked while a chain ended");
         }
     }
 }
@@ -253,7 +255,7 @@ impl Pending<'_> {
 
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        let _ = self.state.with(|inner| {
+        let released = self.state.with(|inner| {
             if let Some(chains) = inner.waiting.get_mut(&self.expansion.source) {
                 if let Some(index) = chains.iter().rposition(|chain| *chain == self.chain) {
                     chains.remove(index);
@@ -268,6 +270,8 @@ impl Drop for Pending<'_> {
                 }
             }
         });
+        // Nothing runs under the lock that could yield or call out, so it is free here.
+        debug_assert!(released.is_ok(), "provider state locked while an ask ended");
     }
 }
 
