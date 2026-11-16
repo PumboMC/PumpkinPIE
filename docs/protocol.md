@@ -233,6 +233,9 @@ What that costs you today:
 - **Nothing has a timeout.** A call is synchronous, so an expansion that hangs holds up whoever
   called it. Keep expansions cheap.
 - **Do not call back into the provider from inside an `on_request` handler.** It is called
-  synchronously from inside the provider's own IPC handler, so re-entering it deadlocks the server.
+  synchronously from inside the provider's own IPC handler. Pumpkin 0.2.0 to 0.2.2 re-enter it
+  within the same call chain, up to 64 nested calls, and then trap the plugin that makes the next
+  one. The provider stops nesting once four of its calls to expansions are waiting, and leaves the
+  placeholder as written.
 
 [ipc]: https://github.com/Pumpkin-MC/Pumpkin/blob/master/crates/pumpkin-plugin-wit/v0.1/ipc.wit
