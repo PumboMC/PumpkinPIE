@@ -124,6 +124,11 @@ struct Inner {
     registry: Registry,
     /// Keyed by expansion source, then by viewer and placeholder.
     cache: ExpansionCache,
+    /// Moves on every register and unregister, so an answer that arrives after
+    /// one is not cached under a registration it was not given for. One counter
+    /// for every expansion: a change anywhere only costs the answers in flight
+    /// their cache entry.
+    generation: u64,
 }
 
 /// The state was already locked, which only a call coming back in while the
@@ -145,6 +150,7 @@ pub(crate) enum Lookup {
 pub(crate) struct Pending {
     pub(crate) expansion: Expansion,
     key: CacheKey,
+    generation: u64,
 }
 
 /// One ask in flight, counted until it is dropped.
@@ -180,6 +186,7 @@ impl State {
     ) -> Result<Result<Expansion, ProtocolError>, Busy> {
         self.with(|inner| {
             inner.cache.retain(|key, _| key.0 != sender);
+            inner.generation += 1;
             inner.registry.add(namespace, sender, names, cache).cloned()
         })
     }
@@ -188,6 +195,7 @@ impl State {
     pub(crate) fn unregister(&self, sender: &str) -> Result<Vec<String>, Busy> {
         self.with(|inner| {
             inner.cache.retain(|key, _| key.0 != sender);
+            inner.generation += 1;
             inner.registry.drop_source(sender)
         })
     }
@@ -215,7 +223,11 @@ impl State {
                     return Lookup::Cached(value);
                 }
             }
-            Lookup::Ask(Pending { expansion, key })
+            Lookup::Ask(Pending {
+                expansion,
+                key,
+                generation: inner.generation,
+            })
         })
     }
 
@@ -228,7 +240,8 @@ impl State {
         Some(InFlight(&self.asks))
     }
 
-    /// Caches an answer if the expansion asked for a TTL.
+    /// Caches an answer if the expansion asked for a TTL, and only if no
+    /// expansion registered or left while it was being asked.
     pub(crate) fn store(
         &self,
         pending: Pending,
@@ -237,7 +250,7 @@ impl State {
     ) -> Result<(), Busy> {
         let ttl = pending.expansion.ttl_ms();
         self.with(|inner| {
-            if ttl == 0 {
+            if ttl == 0 || inner.generation != pending.generation {
                 return;
             }
             cache_insert(
@@ -388,6 +401,35 @@ mod tests {
         assert_eq!(cache_get(&mut cache, &key, now), Some(None));
         assert_eq!(cache_get(&mut cache, &key, now + ttl), None);
         assert!(!cache.contains_key(&key));
+    }
+
+    /// The v0.2 interleaving, one step at a time: a resolve looks the
+    /// expansion up, the expansion registers again or leaves while the
+    /// provider waits for it, and then the answer arrives. Before, the answer
+    /// was cached anyway, under a registration it was not given for.
+    #[test]
+    fn an_answer_is_not_cached_when_its_expansion_changed_while_asked() {
+        let now = Instant::now();
+        let register = |state: &State| {
+            let ttl = Cache::Ttl { ms: 60_000 };
+            state
+                .register("Exp", "exp", Vec::new(), ttl)
+                .unwrap()
+                .unwrap();
+        };
+        let unregister = |state: &State| {
+            state.unregister("Exp").unwrap();
+        };
+        for change in [register as fn(&State), unregister] {
+            let state = State::default();
+            register(&state);
+            let Ok(Lookup::Ask(pending)) = state.lookup("exp_rank", "", None, now) else {
+                panic!("an uncached placeholder is asked for");
+            };
+            change(&state);
+            state.store(pending, Some("old".into()), now).unwrap();
+            assert!(state.inner.lock().unwrap().cache.is_empty());
+        }
     }
 
     #[test]

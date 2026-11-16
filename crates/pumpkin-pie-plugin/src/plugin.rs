@@ -188,6 +188,8 @@ fn resolve_one(
         argument,
     )?;
     let value = ask_expansion(ipc, &pending.expansion.source, &request);
+    // The expansion may have registered again or left while it was asked, so
+    // the state decides whether the answer may still be cached.
     if state.store(pending, value.clone(), Instant::now()).is_err() {
         busy();
     }
@@ -605,6 +607,30 @@ mod tests {
 
         assert_eq!(resolve(&exp, "%exp_loop%"), "<<<<%exp_loop%>>>>");
         assert_eq!(exp.asks.get(), MAX_ASKS_IN_FLIGHT);
+    }
+
+    /// Interleaving as the concurrent v0.2 API allows it: while the provider
+    /// waits for `Exp`, `Exp` reloads and registers again, and then the answer
+    /// it computed before the reload arrives. Before, that answer was cached
+    /// under the new registration and served until its TTL ran out.
+    #[test]
+    fn an_answer_from_before_a_reregistration_is_not_cached() {
+        let state = State::default();
+        let value = Cell::new("old");
+        let on_request = |exp: &Exp<'_>| {
+            let answer = value.replace("new");
+            if answer == "old" {
+                exp.register();
+            }
+            Some(answer.to_string())
+        };
+        let exp = Exp::new(&state, &on_request);
+        exp.register();
+
+        assert_eq!(resolve(&exp, "%exp_rank%"), "old");
+        assert_eq!(resolve(&exp, "%exp_rank%"), "new");
+        assert_eq!(resolve(&exp, "%exp_rank%"), "new");
+        assert_eq!(exp.asks.get(), 2, "the answer after the reload is cached");
     }
 
     /// If a change ever holds the state across a call back in, that call is
