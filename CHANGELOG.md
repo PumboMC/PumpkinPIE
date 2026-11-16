@@ -11,7 +11,8 @@ Pumpkin 0.2.1+26.3-26.51 API; the changes below have not been verified on a live
 - Limit placeholder output and encoded responses, and refuse oversized batches whole.
 - Normalize callback namespaces for mixed-case placeholder IDs.
 - An expansion that resolves placeholders through the provider while it is being asked no
-  longer crashes a plugin, and a value it gave just before reloading is no longer cached.
+  longer crashes a plugin or makes one line cost thousands of calls, and no answer that is out
+  of date or still holds a placeholder as written is cached.
 
 - `set_placeholders_batch` no longer sends a line over 32 KiB. It checked nothing,
   so the line was sent and then dropped by the provider's filter, which returned a

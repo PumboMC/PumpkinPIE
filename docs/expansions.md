@@ -280,8 +280,9 @@ both this and a working component.
 **Never reach for a `PieClient` inside the `resolve` closure.** The provider asks you
 synchronously, from inside its own IPC handler, so calling back re-enters it while it is still
 inside the call that invoked you. Pumpkin 0.2.0 to 0.2.2 allow that within one call chain up to 64
-nested calls, and then trap the plugin that makes the next one. The provider stops nesting once
-four of its calls to expansions are waiting, and leaves the placeholder as written.
+nested calls, and then trap the plugin that makes the next one. The provider allows four asks
+waiting on calls back like yours and 16 asks per line in all, and leaves the placeholder as
+written past either limit.
 
 The same applies to messaging **any other plugin** from inside the closure. It runs on the caller's
 thread inside their critical path, so a slow closure stalls every consumer on the server. Keep it to

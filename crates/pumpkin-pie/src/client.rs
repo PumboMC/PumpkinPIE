@@ -351,8 +351,9 @@ pub fn check_lines_for_testing(lines: &[(&str, &str)]) -> Result<Vec<Line>, PieE
 /// do not call back into the provider from `resolve`. Reaching for a
 /// [`PieClient`] there re-enters the provider while it is still inside the call
 /// that invoked you. Pumpkin 0.2.0 to 0.2.2 allow up to 64 nested calls and then
-/// trap the plugin that makes the next one; the provider stops nesting once four
-/// of its calls to expansions are waiting, and leaves the placeholder as written.
+/// trap the plugin that makes the next one; the provider allows four asks
+/// waiting on such calls back and 16 asks per line in all, and leaves the
+/// placeholder as written past either limit.
 ///
 /// # Errors
 /// Returns [`ProtocolError`] if the message cannot be read or the reply cannot

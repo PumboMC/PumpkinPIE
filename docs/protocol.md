@@ -235,7 +235,8 @@ What that costs you today:
 - **Do not call back into the provider from inside an `on_request` handler.** It is called
   synchronously from inside the provider's own IPC handler. Pumpkin 0.2.0 to 0.2.2 re-enter it
   within the same call chain, up to 64 nested calls, and then trap the plugin that makes the next
-  one. The provider stops nesting once four of its calls to expansions are waiting, and leaves the
-  placeholder as written.
+  one. When an expansion calls back while the provider waits on it, the provider allows four such
+  asks waiting at once and 16 asks per line in all, and leaves the placeholder as written past
+  either limit.
 
 [ipc]: https://github.com/Pumpkin-MC/Pumpkin/blob/master/crates/pumpkin-plugin-wit/v0.1/ipc.wit
