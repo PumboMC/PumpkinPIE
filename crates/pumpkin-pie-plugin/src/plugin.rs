@@ -11,16 +11,17 @@
 //!
 //! The `Plugin` trait hands every callback `&self`, and command handlers must be
 //! `'static`, so the state lives in a [`OnceLock`] rather than on the plugin
-//! value. Nothing here holds a lock across a host call, because the host may
-//! deliver an IPC callback back into this plugin before the call returns.
+//! value. It is only touched inside [`crate::state`], which never calls the
+//! host, so no lock is held across a host call: the host may deliver an IPC
+//! callback back into this plugin before the call returns.
 
 use std::cell::Cell;
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use pumpkin_pie::builtins::{self, ResolveContext};
-use pumpkin_pie::expansion::{Expansion, Registry};
+use pumpkin_pie::expansion::Expansion;
 use pumpkin_pie::protocol::{
     MAX_BATCH_LINES, MAX_ID_LENGTH, MAX_MESSAGE_BYTES, MAX_TEXT_LENGTH, ProtocolError,
     RegisteredPlaceholder, Request, ResolvedLine, Response, Success, decode_request, encode,
@@ -31,6 +32,8 @@ use pumpkin_plugin_api::{
 };
 use tracing::{info, warn};
 
+use crate::state::{Busy, Lookup, MAX_ASKS_IN_FLIGHT, State};
+
 /// Version reported by `ping`.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -39,116 +42,36 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// one message, so a batch of a thousand lines is not penalised for being large.
 const MAX_CALLBACKS_PER_LINE: usize = 16;
 
-/// What one expansion's value is cached against.
-type CacheKey = (String, String, String, Option<String>);
+/// What the IPC import returns: the outer error means the plugin was not
+/// reachable, the inner one that it refused.
+type Reply = Result<Result<IpcMessage, String>, ()>;
 
-/// One expansion's cached values, keyed by viewer and placeholder.
-type ExpansionCache = HashMap<CacheKey, Cached>;
-
-const MAX_CACHE_ENTRIES: usize = 4096;
-const MAX_CACHE_BYTES: usize = 4 * MAX_MESSAGE_BYTES;
-
-/// A cached expansion value, and when it was stored.
-struct Cached {
-    value: Option<String>,
-    stored: Instant,
-    ttl: Duration,
+/// How the provider messages an expansion. The plugin goes through the host;
+/// the tests answer from a fake expansion that can call straight back in.
+pub(crate) trait Ipc {
+    fn send(&self, recipient: &str, message: &[u8]) -> Reply;
 }
 
-fn entry_size(key: &CacheKey, value: &Option<String>) -> usize {
-    key.0.len()
-        + key.1.len()
-        + key.2.len()
-        + key.3.as_ref().map_or(0, String::len)
-        + value.as_ref().map_or(0, String::len)
-}
+/// The server's inter-plugin IPC.
+struct HostIpc;
 
-fn cache_key(source: &str, viewer: &str, id: &str, argument: Option<&str>) -> CacheKey {
-    (
-        source.to_string(),
-        viewer.to_string(),
-        id.to_ascii_lowercase(),
-        argument.map(str::to_string),
-    )
-}
-
-fn cache_get(cache: &mut ExpansionCache, key: &CacheKey, now: Instant) -> Option<Option<String>> {
-    let entry = cache.get(key)?;
-    if now.saturating_duration_since(entry.stored) >= entry.ttl {
-        cache.remove(key);
-        return None;
+impl Ipc for HostIpc {
+    fn send(&self, recipient: &str, message: &[u8]) -> Reply {
+        pumpkin_plugin_api::ipc::send_ipc_message(recipient, message)
     }
-    Some(entry.value.clone())
-}
-
-fn cache_insert(
-    cache: &mut ExpansionCache,
-    key: CacheKey,
-    value: Option<String>,
-    ttl: Duration,
-    now: Instant,
-    max_entries: usize,
-    max_bytes: usize,
-) {
-    cache.retain(|_, item| now.saturating_duration_since(item.stored) < item.ttl);
-    cache.remove(&key);
-    let size = entry_size(&key, &value);
-    if max_entries == 0 || size > max_bytes {
-        return;
-    }
-    let mut used: usize = cache
-        .iter()
-        .map(|(key, item)| entry_size(key, &item.value))
-        .sum();
-    while cache.len() >= max_entries || size > max_bytes.saturating_sub(used) {
-        let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, item)| item.stored)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        if let Some(item) = cache.remove(&oldest) {
-            used -= entry_size(&oldest, &item.value);
-        }
-    }
-    cache.insert(
-        key,
-        Cached {
-            value,
-            stored: now,
-            ttl,
-        },
-    );
-}
-
-/// Everything the provider owns.
-struct State {
-    registry: Mutex<Registry>,
-    /// Keyed by expansion source, then by viewer and placeholder.
-    cache: Mutex<ExpansionCache>,
-    server: OnceLock<Server>,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
+static SERVER: OnceLock<Server> = OnceLock::new();
+
+/// Each logged the first time it happens, so a misconfiguration that repeats on
+/// every refresh does not flood the log.
+static BUSY_LOGGED: AtomicBool = AtomicBool::new(false);
+static NESTING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The provider's state.
-///
-/// # Panics
-/// Panics if called before `on_load`, which the host does not do.
 fn state() -> &'static State {
-    STATE.get_or_init(|| State {
-        registry: Mutex::new(Registry::new()),
-        cache: Mutex::new(HashMap::new()),
-        server: OnceLock::new(),
-    })
-}
-
-/// A poisoned lock is a bug, not a reason to stop resolving placeholders.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    STATE.get_or_init(State::default)
 }
 
 /// The server handle `on_load` was given.
@@ -156,10 +79,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// # Panics
 /// Panics if called before `on_load`.
 pub fn server() -> &'static Server {
-    state()
-        .server
+    SERVER
         .get()
         .expect("the server handle is only valid after on_load")
+}
+
+/// Refuses a call that found the state locked, rather than trapping on it.
+fn busy() -> Response {
+    if !BUSY_LOGGED.swap(true, Ordering::Relaxed) {
+        warn!("provider state was locked by a call still in progress; refused the next one");
+    }
+    Response::failure("PumpkinPIE is busy, try again")
 }
 
 /// Resolves one line, returning the text and what stayed unresolved.
@@ -174,13 +104,29 @@ pub(crate) fn try_resolve_line(
     viewer_name: Option<&str>,
     text: &str,
 ) -> Result<ResolvedLine, ProtocolError> {
-    let server = server();
-    let viewer = viewer_name.and_then(|name| server.get_player_by_name(name));
+    resolve_text(state(), &HostIpc, viewer_name, text)
+}
+
+fn resolve_text(
+    state: &State,
+    ipc: &dyn Ipc,
+    viewer_name: Option<&str>,
+    text: &str,
+) -> Result<ResolvedLine, ProtocolError> {
+    let viewer = viewer_name.and_then(|name| server().get_player_by_name(name));
     let viewer_key = viewer_name.unwrap_or_default().to_string();
     let budget = Cell::new(MAX_CALLBACKS_PER_LINE);
 
     let result = pumpkin_pie::tokens::try_substitute(text, MAX_MESSAGE_BYTES, |id, argument| {
-        resolve_one(viewer.as_ref(), &viewer_key, id, argument, &budget)
+        resolve_one(
+            state,
+            ipc,
+            viewer.as_ref(),
+            &viewer_key,
+            id,
+            argument,
+            &budget,
+        )
     })
     .map_err(|_| ProtocolError::TooLarge)?;
     Ok(ResolvedLine {
@@ -191,43 +137,60 @@ pub(crate) fn try_resolve_line(
 
 /// Resolves a single placeholder, or `None` to leave it alone.
 fn resolve_one(
+    state: &State,
+    ipc: &dyn Ipc,
     viewer: Option<&Player>,
     viewer_key: &str,
     id: &str,
     argument: Option<&str>,
     budget: &Cell<usize>,
 ) -> Option<String> {
-    let server = server();
-
     if let Some(builtin) = builtins::find(id) {
         let context = ResolveContext {
-            server,
+            server: server(),
             viewer,
             argument,
         };
         return (builtin.resolve)(&context);
     }
 
-    let expansion = lock(&state().registry).owner_of(id)?.clone();
-    let key = cache_key(&expansion.source, viewer_key, id, argument);
-    if let Some(cached) = cached(&expansion, &key) {
-        return cached;
-    }
+    let pending = match state.lookup(id, viewer_key, argument, Instant::now()) {
+        Ok(Lookup::Unknown) => return None,
+        Ok(Lookup::Cached(value)) => return value,
+        Ok(Lookup::Ask(pending)) => pending,
+        Err(Busy) => {
+            busy();
+            return None;
+        }
+    };
 
     if budget.get() == 0 {
         warn!("callback budget spent, leaving {id} alone");
         return None;
     }
+    // Held across the ask, so an expansion that resolves through the provider
+    // while it is being asked cannot nest without end. A counter, not a lock.
+    let Some(_in_flight) = state.begin_ask() else {
+        if !NESTING_LOGGED.swap(true, Ordering::Relaxed) {
+            warn!(
+                "leaving {id} alone: {MAX_ASKS_IN_FLIGHT} expansion callbacks are already \
+                 waiting, so an expansion is probably resolving its own placeholders"
+            );
+        }
+        return None;
+    };
     budget.set(budget.get() - 1);
 
     let request = callback_request(
-        &expansion,
+        &pending.expansion,
         id,
         viewer.map(|player| player.get_name()),
         argument,
     )?;
-    let value = ask_expansion(&expansion.source, &request);
-    store(&expansion, key, value.clone());
+    let value = ask_expansion(ipc, &pending.expansion.source, &request);
+    if state.store(pending, value.clone(), Instant::now()).is_err() {
+        busy();
+    }
     value
 }
 
@@ -251,32 +214,15 @@ fn callback_request(
     })
 }
 
-/// Reads a cached value if it is still inside its expansion's TTL.
-fn cached(expansion: &Expansion, key: &CacheKey) -> Option<Option<String>> {
-    if expansion.ttl_ms() == 0 {
-        return None;
-    }
-    cache_get(&mut lock(&state().cache), key, Instant::now())
-}
-
-/// Stores a value if the expansion asked for a TTL.
-fn store(expansion: &Expansion, key: CacheKey, value: Option<String>) {
-    if expansion.ttl_ms() == 0 {
-        return;
-    }
-    cache_insert(
-        &mut lock(&state().cache),
-        key,
-        value,
-        Duration::from_millis(expansion.ttl_ms()),
-        Instant::now(),
-        MAX_CACHE_ENTRIES,
-        MAX_CACHE_BYTES,
-    );
-}
-
 /// Every placeholder the provider knows, built in and contributed.
 pub fn registered() -> Vec<RegisteredPlaceholder> {
+    registered_in(state()).unwrap_or_else(|Busy| {
+        busy();
+        Vec::new()
+    })
+}
+
+fn registered_in(state: &State) -> Result<Vec<RegisteredPlaceholder>, Busy> {
     let mut entries: Vec<RegisteredPlaceholder> = builtins::BUILTINS
         .iter()
         .map(|builtin| RegisteredPlaceholder {
@@ -287,7 +233,7 @@ pub fn registered() -> Vec<RegisteredPlaceholder> {
         })
         .collect();
 
-    for expansion in lock(&state().registry).all() {
+    for expansion in state.expansions()? {
         for name in &expansion.names {
             entries.push(RegisteredPlaceholder {
                 id: format!("{}_{}", expansion.namespace, name),
@@ -299,13 +245,17 @@ pub fn registered() -> Vec<RegisteredPlaceholder> {
     }
     entries.sort_by(|left, right| left.id.cmp(&right.id));
     entries.dedup_by(|left, right| left.id == right.id);
-    entries
+    Ok(entries)
 }
 
 /// One line per registered expansion, for `/pie`.
 pub fn expansion_summary() -> Vec<String> {
-    lock(&state().registry)
-        .all()
+    let Ok(expansions) = state().expansions() else {
+        busy();
+        return Vec::new();
+    };
+    expansions
+        .iter()
         .map(|expansion| {
             let names = if expansion.names.is_empty() {
                 "answers anything".to_string()
@@ -326,52 +276,51 @@ pub fn expansion_summary() -> Vec<String> {
 }
 
 /// Handles one decoded request.
-fn handle(sender: &str, request: Request) -> Response {
+fn handle(state: &State, ipc: &dyn Ipc, sender: &str, request: Request) -> Response {
     match request {
-        Request::Ping => Response::success(Success::Ping {
-            protocol: pumpkin_pie::PROTOCOL_VERSION,
-            name: pumpkin_pie::PROVIDER.to_string(),
-            version: VERSION.to_string(),
-            placeholders: builtins::count(),
-            expansions: lock(&state().registry).len(),
-        }),
-        Request::GetRegisteredPlaceholders => Response::success(Success::Registered {
-            placeholders: registered(),
-        }),
+        Request::Ping => {
+            let Ok(expansions) = state.expansions() else {
+                return busy();
+            };
+            Response::success(Success::Ping {
+                protocol: pumpkin_pie::PROTOCOL_VERSION,
+                name: pumpkin_pie::PROVIDER.to_string(),
+                version: VERSION.to_string(),
+                placeholders: builtins::count(),
+                expansions: expansions.len(),
+            })
+        }
+        Request::GetRegisteredPlaceholders => match registered_in(state) {
+            Ok(placeholders) => Response::success(Success::Registered { placeholders }),
+            Err(Busy) => busy(),
+        },
         Request::RegisterExpansion {
             namespace,
             placeholders,
             cache,
-        } => {
-            forget(sender);
-            let claimed = {
-                let mut registry = lock(&state().registry);
-                registry
-                    .add(&namespace, sender, placeholders, cache)
-                    .cloned()
-            };
-            match claimed {
-                Ok(expansion) => Response::success(Success::RegisteredExpansion {
-                    namespace: expansion.namespace,
-                    placeholders: expansion.names.into_iter().collect(),
-                    cache: expansion.cache,
-                }),
-                Err(error) => Response::from_error(error),
-            }
-        }
+        } => match state.register(sender, &namespace, placeholders, cache) {
+            Ok(Ok(expansion)) => Response::success(Success::RegisteredExpansion {
+                namespace: expansion.namespace,
+                placeholders: expansion.names.into_iter().collect(),
+                cache: expansion.cache,
+            }),
+            Ok(Err(error)) => Response::from_error(error),
+            Err(Busy) => busy(),
+        },
         Request::UnregisterExpansion => {
-            let namespaces = lock(&state().registry).drop_source(sender);
+            let Ok(namespaces) = state.unregister(sender) else {
+                return busy();
+            };
             for namespace in &namespaces {
                 info!("{sender} released {namespace}");
             }
-            forget(sender);
             Response::success(Success::Unregistered { namespaces })
         }
         Request::SetPlaceholders { text, viewer, .. } => {
             if let Err(error) = check_text(&text) {
                 return Response::from_error(error);
             }
-            match try_resolve_line(viewer.as_deref(), &text) {
+            match resolve_text(state, ipc, viewer.as_deref(), &text) {
                 Ok(line) => Response::success(Success::Resolved(line)),
                 Err(error) => Response::from_error(error),
             }
@@ -382,7 +331,7 @@ fn handle(sender: &str, request: Request) -> Response {
             }
             resolve_batch(
                 &requests,
-                |line| try_resolve_line(line.viewer.as_deref(), &line.text),
+                |line| resolve_text(state, ipc, line.viewer.as_deref(), &line.text),
                 MAX_MESSAGE_BYTES,
             )
         }
@@ -403,6 +352,8 @@ fn handle(sender: &str, request: Request) -> Response {
                 .as_deref()
                 .and_then(|name| server().get_player_by_name(name));
             match resolve_one(
+                state,
+                ipc,
                 resolved.as_ref(),
                 &viewer_key,
                 &id,
@@ -477,15 +428,10 @@ fn encode_response(response: &Response) -> Vec<u8> {
     })
 }
 
-/// Drops anything cached for `sender`, which a re-register invalidates.
-fn forget(sender: &str) {
-    lock(&state().cache).retain(|key, _| key.0 != sender);
-}
-
 /// Asks the plugin that owns an expansion for one of its placeholders.
-fn ask_expansion(source: &str, request: &Request) -> Option<String> {
+fn ask_expansion(ipc: &dyn Ipc, source: &str, request: &Request) -> Option<String> {
     let bytes = encode(request).ok()?;
-    let reply = match pumpkin_plugin_api::ipc::send_ipc_message(source, &bytes) {
+    let reply = match ipc.send(source, &bytes) {
         Ok(Ok(reply)) => reply,
         Ok(Err(message)) => {
             warn!("{source} refused an on_request: {message}");
@@ -532,7 +478,7 @@ impl Plugin for PumpkinPie {
     }
 
     fn on_load(&self, context: Context) -> Result<()> {
-        let _ = state().server.set(context.get_server());
+        let _ = SERVER.set(context.get_server());
         crate::command::register(context);
         info!(
             "PumpkinPIE {VERSION} ready with {} built in placeholders",
@@ -557,7 +503,7 @@ impl Plugin for PumpkinPie {
                 return Ok(encode(&Response::from_error(error)).unwrap_or_default());
             }
         };
-        let response = handle(&sender, request);
+        let response = handle(state(), &HostIpc, &sender, request);
         Ok(encode_response(&response))
     }
 }
@@ -567,132 +513,117 @@ register_plugin!(PumpkinPie);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumpkin_pie::answer;
+    use pumpkin_pie::expansion::Registry;
     use pumpkin_pie::protocol::{Cache, Line, decode_response};
 
-    #[test]
-    fn cache_distinguishes_arguments_and_negative_values() {
-        let mut cache = ExpansionCache::new();
-        let now = Instant::now();
-        let ttl = Duration::from_secs(10);
-        for (arg, value) in [
-            (None, Some("none")),
-            (Some(""), None),
-            (Some("gold"), Some("10")),
-            (Some("silver"), Some("50")),
-        ] {
-            cache_insert(
-                &mut cache,
-                cache_key("exp", "Steve", "RANKS_value", arg),
-                value.map(str::to_string),
-                ttl,
-                now,
-                10,
-                1000,
-            );
-        }
-        for (arg, value) in [
-            (None, Some("none")),
-            (Some(""), None),
-            (Some("gold"), Some("10")),
-            (Some("silver"), Some("50")),
-        ] {
-            assert_eq!(
-                cache_get(
-                    &mut cache,
-                    &cache_key("exp", "Steve", "ranks_value", arg),
-                    now
-                ),
-                Some(value.map(str::to_string))
-            );
+    /// The plugin `Exp` on a fake server. The provider asks it over [`Ipc`], it
+    /// answers through the same `answer` an expansion embeds, and `call` reaches
+    /// the provider's handler while the ask is still open, which is what
+    /// Pumpkin does when an asked plugin messages the provider back.
+    struct Exp<'a> {
+        state: &'a State,
+        on_request: &'a dyn Fn(&Exp<'a>) -> Option<String>,
+        asks: Cell<usize>,
+        depth: Cell<usize>,
+    }
+
+    impl Ipc for Exp<'_> {
+        fn send(&self, recipient: &str, message: &[u8]) -> Reply {
+            assert_eq!(recipient, "Exp");
+            self.asks.set(self.asks.get() + 1);
+            let reply = self.nest(|| answer(message, |_| (self.on_request)(self)));
+            Ok(Ok(reply.expect("the reply encodes")))
         }
     }
 
+    impl<'a> Exp<'a> {
+        fn new(state: &'a State, on_request: &'a dyn Fn(&Exp<'a>) -> Option<String>) -> Self {
+            Self {
+                state,
+                on_request,
+                asks: Cell::new(0),
+                depth: Cell::new(0),
+            }
+        }
+
+        /// One more hop on the call chain. Pumpkin allows 64 and traps the
+        /// plugin that makes the next one.
+        fn nest<T>(&self, call: impl FnOnce() -> T) -> T {
+            assert!(self.depth.get() < 64, "Pumpkin traps a plugin here");
+            self.depth.set(self.depth.get() + 1);
+            let result = call();
+            self.depth.set(self.depth.get() - 1);
+            result
+        }
+
+        /// `Exp` messaging the provider.
+        fn call(&self, request: Request) -> Response {
+            self.nest(|| handle(self.state, self, "Exp", request))
+        }
+
+        fn register(&self) {
+            let response = self.call(Request::RegisterExpansion {
+                namespace: "exp".to_string(),
+                placeholders: Vec::new(),
+                cache: Cache::Ttl { ms: 60_000 },
+            });
+            assert!(response.ok, "{response:?}");
+        }
+    }
+
+    fn set_placeholders(text: &str) -> Request {
+        Request::SetPlaceholders {
+            text: text.to_string(),
+            viewer: None,
+            argument: None,
+        }
+    }
+
+    fn text_of(response: Response) -> String {
+        match response.into_success() {
+            Ok(Success::Resolved(line)) => line.text,
+            other => panic!("expected a resolved line, got {other:?}"),
+        }
+    }
+
+    /// Another plugin, say a tab list, resolving `text`.
+    fn resolve(exp: &Exp<'_>, text: &str) -> String {
+        text_of(handle(exp.state, exp, "TabList", set_placeholders(text)))
+    }
+
+    /// Re-entry as the v0.1 API does it: `Exp` answers by resolving its own
+    /// placeholder through the provider, which is still waiting on that answer.
+    /// Nothing stopped this before, so it recursed until Pumpkin trapped a
+    /// plugin at 64 nested calls.
     #[test]
-    fn cache_evicts_expired_and_oldest_entries_and_limits_bytes() {
-        let mut cache = ExpansionCache::new();
-        let now = Instant::now();
-        let ttl = Duration::from_secs(2);
-        let a = cache_key("s", "", "a", None);
-        let b = cache_key("s", "", "b", None);
-        let c = cache_key("s", "", "c", None);
-        cache_insert(&mut cache, a.clone(), Some("x".into()), ttl, now, 2, 100);
-        cache_insert(
-            &mut cache,
-            b.clone(),
-            None,
-            ttl,
-            now + Duration::from_millis(1),
-            2,
-            100,
-        );
-        cache_insert(
-            &mut cache,
-            c.clone(),
-            None,
-            ttl,
-            now + Duration::from_millis(2),
-            2,
-            100,
-        );
-        assert!(!cache.contains_key(&a));
-        assert!(cache.contains_key(&b));
-        cache_insert(
-            &mut cache,
-            a.clone(),
-            None,
-            ttl,
-            now + ttl + Duration::from_millis(2),
-            2,
-            100,
-        );
-        assert!(!cache.contains_key(&c));
+    fn an_expansion_resolving_its_own_placeholder_stops_nesting() {
+        let state = State::default();
+        let on_request = |exp: &Exp<'_>| Some(text_of(exp.call(set_placeholders("<%exp_loop%>"))));
+        let exp = Exp::new(&state, &on_request);
+        exp.register();
+
+        assert_eq!(resolve(&exp, "%exp_loop%"), "<<<<%exp_loop%>>>>");
+        assert_eq!(exp.asks.get(), MAX_ASKS_IN_FLIGHT);
+    }
+
+    /// If a change ever holds the state across a call back in, that call is
+    /// refused. Locking twice instead would panic on Wasm and trap the plugin.
+    #[test]
+    fn a_locked_state_refuses_instead_of_trapping() {
+        let state = State::default();
+        let on_request = |_: &Exp<'_>| Some("value".to_string());
+        let exp = Exp::new(&state, &on_request);
+        exp.register();
+        let _held = state.hold();
+
+        assert_eq!(resolve(&exp, "%exp_rank%"), "%exp_rank%");
+        let response = handle(&state, &exp, "Exp", Request::UnregisterExpansion);
         assert_eq!(
-            cache_get(&mut cache, &b, now + ttl + Duration::from_millis(1)),
-            None
+            response.error.as_deref(),
+            Some("PumpkinPIE is busy, try again")
         );
-        cache_insert(
-            &mut cache,
-            b.clone(),
-            Some("too large".into()),
-            ttl,
-            now + ttl,
-            2,
-            3,
-        );
-        assert!(!cache.contains_key(&b));
-    }
-
-    #[test]
-    fn cache_evicts_old_entries_to_fit_byte_budget() {
-        let mut cache = ExpansionCache::new();
-        let now = Instant::now();
-        let ttl = Duration::from_secs(5);
-        let a = cache_key("s", "", "a", None);
-        let b = cache_key("s", "", "b", None);
-        cache_insert(&mut cache, a.clone(), Some("123".into()), ttl, now, 10, 7);
-        cache_insert(
-            &mut cache,
-            b.clone(),
-            Some("456".into()),
-            ttl,
-            now + Duration::from_millis(1),
-            10,
-            7,
-        );
-        assert!(!cache.contains_key(&a));
-        assert!(cache.contains_key(&b));
-    }
-
-    #[test]
-    fn cache_removes_an_expired_entry_on_lookup() {
-        let mut cache = ExpansionCache::new();
-        let now = Instant::now();
-        let ttl = Duration::from_secs(1);
-        let key = cache_key("s", "viewer", "s_value", None);
-        cache_insert(&mut cache, key.clone(), None, ttl, now, 2, 100);
-        assert_eq!(cache_get(&mut cache, &key, now), Some(None));
-        assert_eq!(cache_get(&mut cache, &key, now + ttl), None);
-        assert!(!cache.contains_key(&key));
+        assert_eq!(exp.asks.get(), 0);
     }
 
     #[test]

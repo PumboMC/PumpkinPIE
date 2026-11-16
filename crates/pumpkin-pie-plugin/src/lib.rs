@@ -6,6 +6,7 @@
 
 pub mod command;
 mod plugin;
+mod state;
 
 pub use plugin::{PumpkinPie, expansion_summary, registered, resolve_line, server};
 
