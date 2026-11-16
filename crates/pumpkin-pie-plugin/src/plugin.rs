@@ -15,10 +15,9 @@
 //! host, so no lock is held across a host call: the host may deliver an IPC
 //! callback back into this plugin before the call returns.
 
-use std::cell::Cell;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use pumpkin_pie::builtins::{self, ResolveContext};
 use pumpkin_pie::expansion::Expansion;
@@ -32,15 +31,13 @@ use pumpkin_plugin_api::{
 };
 use tracing::{info, warn};
 
-use crate::state::{Busy, Lookup, MAX_ASKS_IN_FLIGHT, State};
+use crate::state::{Busy, Chain, Lookup, MAX_ASKS_PER_LINE, MAX_NESTED_ASKS, Refusal, State};
 
 /// Version reported by `ping`.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// An expansion is asked synchronously, so a misbehaving one could otherwise
-/// ask for placeholders forever. This is the budget for one resolved line, not
-/// one message, so a batch of a thousand lines is not penalised for being large.
-const MAX_CALLBACKS_PER_LINE: usize = 16;
+/// How long the same warning about the same expansion stays quiet.
+const WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// What the IPC import returns: the outer error means the plugin was not
 /// reachable, the inner one that it refused.
@@ -64,10 +61,9 @@ impl Ipc for HostIpc {
 static STATE: OnceLock<State> = OnceLock::new();
 static SERVER: OnceLock<Server> = OnceLock::new();
 
-/// Each logged the first time it happens, so a misconfiguration that repeats on
-/// every refresh does not flood the log.
-static BUSY_LOGGED: AtomicBool = AtomicBool::new(false);
-static NESTING_LOGGED: AtomicBool = AtomicBool::new(false);
+/// When each warning was last logged, by what it is about. Its lock is held only
+/// inside [`should_warn`], which calls nothing, so it is never contended.
+static WARNED: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 
 /// The provider's state.
 fn state() -> &'static State {
@@ -84,10 +80,28 @@ pub fn server() -> &'static Server {
         .expect("the server handle is only valid after on_load")
 }
 
+/// Whether a warning about `about` is due: the first one, then one a minute,
+/// so a misconfiguration that repeats on every refresh is named without
+/// flooding the log.
+fn should_warn(about: &str, now: Instant) -> bool {
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let warned = warned.get_or_insert_with(HashMap::new);
+    if warned
+        .get(about)
+        .is_some_and(|last| now.saturating_duration_since(*last) < WARN_EVERY)
+    {
+        return false;
+    }
+    warned.insert(about.to_string(), now);
+    true
+}
+
 /// Refuses a call that found the state locked, rather than trapping on it.
-fn busy() -> Response {
-    if !BUSY_LOGGED.swap(true, Ordering::Relaxed) {
-        warn!("provider state was locked by a call still in progress; refused the next one");
+fn busy(about: &str) -> Response {
+    if should_warn(&format!("busy {about}"), Instant::now()) {
+        warn!("provider state was locked by a call still in progress; refused {about}");
     }
     Response::failure("PumpkinPIE is busy, try again")
 }
@@ -104,28 +118,31 @@ pub(crate) fn try_resolve_line(
     viewer_name: Option<&str>,
     text: &str,
 ) -> Result<ResolvedLine, ProtocolError> {
-    resolve_text(state(), &HostIpc, viewer_name, text)
+    resolve_text(state(), &HostIpc, None, viewer_name, text)
 }
 
+/// Resolves one line for `sender`, the plugin that asked, or `None` for the
+/// server itself.
 fn resolve_text(
     state: &State,
     ipc: &dyn Ipc,
+    sender: Option<&str>,
     viewer_name: Option<&str>,
     text: &str,
 ) -> Result<ResolvedLine, ProtocolError> {
     let viewer = viewer_name.and_then(|name| server().get_player_by_name(name));
     let viewer_key = viewer_name.unwrap_or_default().to_string();
-    let budget = Cell::new(MAX_CALLBACKS_PER_LINE);
+    let chain = state.chain(sender);
 
     let result = pumpkin_pie::tokens::try_substitute(text, MAX_MESSAGE_BYTES, |id, argument| {
         resolve_one(
             state,
             ipc,
+            &chain,
             viewer.as_ref(),
             &viewer_key,
             id,
             argument,
-            &budget,
         )
     })
     .map_err(|_| ProtocolError::TooLarge)?;
@@ -139,11 +156,11 @@ fn resolve_text(
 fn resolve_one(
     state: &State,
     ipc: &dyn Ipc,
+    chain: &Chain<'_>,
     viewer: Option<&Player>,
     viewer_key: &str,
     id: &str,
     argument: Option<&str>,
-    budget: &Cell<usize>,
 ) -> Option<String> {
     if let Some(builtin) = builtins::find(id) {
         let context = ResolveContext {
@@ -154,32 +171,31 @@ fn resolve_one(
         return (builtin.resolve)(&context);
     }
 
-    let pending = match state.lookup(id, viewer_key, argument, Instant::now()) {
+    let now = Instant::now();
+    let pending = match state.lookup(chain, id, viewer_key, argument, now) {
         Ok(Lookup::Unknown) => return None,
         Ok(Lookup::Cached(value)) => return value,
         Ok(Lookup::Ask(pending)) => pending,
+        Ok(Lookup::Refused { source, why }) => {
+            if should_warn(&format!("{why:?} {source}"), now) {
+                match why {
+                    Refusal::Budget => warn!(
+                        "leaving {id} alone: one line may ask expansions {MAX_ASKS_PER_LINE} \
+                         times, calls back included, and {source} was next"
+                    ),
+                    Refusal::Nesting => warn!(
+                        "leaving {id} alone: {source} keeps resolving placeholders through \
+                         PumpkinPIE while it is being asked, {MAX_NESTED_ASKS} deep"
+                    ),
+                }
+            }
+            return None;
+        }
         Err(Busy) => {
-            busy();
+            busy(id);
             return None;
         }
     };
-
-    if budget.get() == 0 {
-        warn!("callback budget spent, leaving {id} alone");
-        return None;
-    }
-    // Held across the ask, so an expansion that resolves through the provider
-    // while it is being asked cannot nest without end. A counter, not a lock.
-    let Some(_in_flight) = state.begin_ask() else {
-        if !NESTING_LOGGED.swap(true, Ordering::Relaxed) {
-            warn!(
-                "leaving {id} alone: {MAX_ASKS_IN_FLIGHT} expansion callbacks are already \
-                 waiting, so an expansion is probably resolving its own placeholders"
-            );
-        }
-        return None;
-    };
-    budget.set(budget.get() - 1);
 
     let request = callback_request(
         &pending.expansion,
@@ -188,10 +204,10 @@ fn resolve_one(
         argument,
     )?;
     let value = ask_expansion(ipc, &pending.expansion.source, &request);
-    // The expansion may have registered again or left while it was asked, so
-    // the state decides whether the answer may still be cached.
-    if state.store(pending, value.clone(), Instant::now()).is_err() {
-        busy();
+    // The state decides whether the answer may still be cached: the expansion
+    // may have registered again meanwhile.
+    if pending.store(value.clone()).is_err() {
+        busy(id);
     }
     value
 }
@@ -219,7 +235,7 @@ fn callback_request(
 /// Every placeholder the provider knows, built in and contributed.
 pub fn registered() -> Vec<RegisteredPlaceholder> {
     registered_in(state()).unwrap_or_else(|Busy| {
-        busy();
+        busy("the /pie command");
         Vec::new()
     })
 }
@@ -253,7 +269,7 @@ fn registered_in(state: &State) -> Result<Vec<RegisteredPlaceholder>, Busy> {
 /// One line per registered expansion, for `/pie`.
 pub fn expansion_summary() -> Vec<String> {
     let Ok(expansions) = state().expansions() else {
-        busy();
+        busy("the /pie command");
         return Vec::new();
     };
     expansions
@@ -282,7 +298,7 @@ fn handle(state: &State, ipc: &dyn Ipc, sender: &str, request: Request) -> Respo
     match request {
         Request::Ping => {
             let Ok(expansions) = state.expansions() else {
-                return busy();
+                return busy(sender);
             };
             Response::success(Success::Ping {
                 protocol: pumpkin_pie::PROTOCOL_VERSION,
@@ -294,7 +310,7 @@ fn handle(state: &State, ipc: &dyn Ipc, sender: &str, request: Request) -> Respo
         }
         Request::GetRegisteredPlaceholders => match registered_in(state) {
             Ok(placeholders) => Response::success(Success::Registered { placeholders }),
-            Err(Busy) => busy(),
+            Err(Busy) => busy(sender),
         },
         Request::RegisterExpansion {
             namespace,
@@ -307,11 +323,11 @@ fn handle(state: &State, ipc: &dyn Ipc, sender: &str, request: Request) -> Respo
                 cache: expansion.cache,
             }),
             Ok(Err(error)) => Response::from_error(error),
-            Err(Busy) => busy(),
+            Err(Busy) => busy(sender),
         },
         Request::UnregisterExpansion => {
             let Ok(namespaces) = state.unregister(sender) else {
-                return busy();
+                return busy(sender);
             };
             for namespace in &namespaces {
                 info!("{sender} released {namespace}");
@@ -322,7 +338,7 @@ fn handle(state: &State, ipc: &dyn Ipc, sender: &str, request: Request) -> Respo
             if let Err(error) = check_text(&text) {
                 return Response::from_error(error);
             }
-            match resolve_text(state, ipc, viewer.as_deref(), &text) {
+            match resolve_text(state, ipc, Some(sender), viewer.as_deref(), &text) {
                 Ok(line) => Response::success(Success::Resolved(line)),
                 Err(error) => Response::from_error(error),
             }
@@ -333,7 +349,7 @@ fn handle(state: &State, ipc: &dyn Ipc, sender: &str, request: Request) -> Respo
             }
             resolve_batch(
                 &requests,
-                |line| resolve_text(state, ipc, line.viewer.as_deref(), &line.text),
+                |line| resolve_text(state, ipc, Some(sender), line.viewer.as_deref(), &line.text),
                 MAX_MESSAGE_BYTES,
             )
         }
@@ -348,7 +364,7 @@ fn handle(state: &State, ipc: &dyn Ipc, sender: &str, request: Request) -> Respo
                     limit: MAX_ID_LENGTH,
                 });
             }
-            let budget = Cell::new(MAX_CALLBACKS_PER_LINE);
+            let chain = state.chain(Some(sender));
             let viewer_key = viewer.clone().unwrap_or_default();
             let resolved = viewer
                 .as_deref()
@@ -356,11 +372,11 @@ fn handle(state: &State, ipc: &dyn Ipc, sender: &str, request: Request) -> Respo
             match resolve_one(
                 state,
                 ipc,
+                &chain,
                 resolved.as_ref(),
                 &viewer_key,
                 &id,
                 argument.as_deref(),
-                &budget,
             ) {
                 Some(value) => Response::success(Success::Value {
                     known: true,
@@ -518,6 +534,7 @@ mod tests {
     use pumpkin_pie::answer;
     use pumpkin_pie::expansion::Registry;
     use pumpkin_pie::protocol::{Cache, Line, decode_response};
+    use std::cell::Cell;
 
     /// The plugin `Exp` on a fake server. The provider asks it over [`Ipc`], it
     /// answers through the same `answer` an expansion embeds, and `call` reaches
@@ -605,14 +622,15 @@ mod tests {
         let exp = Exp::new(&state, &on_request);
         exp.register();
 
-        assert_eq!(resolve(&exp, "%exp_loop%"), "<<<<%exp_loop%>>>>");
-        assert_eq!(exp.asks.get(), MAX_ASKS_IN_FLIGHT);
+        assert_eq!(resolve(&exp, "%exp_loop%"), "<<<<<%exp_loop%>>>>>");
+        assert_eq!(exp.asks.get(), 1 + MAX_NESTED_ASKS);
     }
 
-    /// Interleaving as the concurrent v0.2 API allows it: while the provider
-    /// waits for `Exp`, `Exp` reloads and registers again, and then the answer
-    /// it computed before the reload arrives. Before, that answer was cached
-    /// under the new registration and served until its TTL ran out.
+    /// `Exp` reloads and registers again from inside its own answer, which is
+    /// how the v0.1 API runs a call while an ask is open; a reload under the
+    /// concurrent v0.2 API lands at the same point. The answer computed before
+    /// the reload arrives after it. Before, that answer was cached under the
+    /// new registration and served until its TTL ran out.
     #[test]
     fn an_answer_from_before_a_reregistration_is_not_cached() {
         let state = State::default();
@@ -650,6 +668,78 @@ mod tests {
             Some("PumpkinPIE is busy, try again")
         );
         assert_eq!(exp.asks.get(), 0);
+    }
+
+    fn register_as(exp: &Exp<'_>, cache: Cache) {
+        let response = exp.call(Request::RegisterExpansion {
+            namespace: "exp".to_string(),
+            placeholders: Vec::new(),
+            cache,
+        });
+        assert!(response.ok, "{response:?}");
+    }
+
+    /// Under the concurrent v0.2 API callers wait on expansions side by side,
+    /// played here by each new caller arriving while the previous one waits.
+    /// Before, four of them waiting sent the next caller's line back as
+    /// written, because every ask on the server counted towards the limit.
+    #[test]
+    fn callers_waiting_side_by_side_do_not_stop_another_caller() {
+        let state = State::default();
+        let callers = Cell::new(1);
+        let on_request = |exp: &Exp<'_>| {
+            let caller = callers.get();
+            if caller <= MAX_NESTED_ASKS {
+                callers.set(caller + 1);
+                let caller = format!("TabList{caller}");
+                let line = text_of(handle(
+                    exp.state,
+                    exp,
+                    &caller,
+                    set_placeholders("%exp_rank%"),
+                ));
+                assert_eq!(line, "value", "{caller} was refused");
+            }
+            Some("value".to_string())
+        };
+        let exp = Exp::new(&state, &on_request);
+        register_as(&exp, Cache::Never);
+
+        assert_eq!(resolve(&exp, "%exp_rank%"), "value");
+        assert_eq!(exp.asks.get(), MAX_NESTED_ASKS + 1);
+    }
+
+    /// An expansion answering each placeholder by resolving sixteen more of its
+    /// own got a fresh budget at every level before, so one line cost 69,904
+    /// asks. Calls nested under a line now share its budget.
+    #[test]
+    fn calls_nested_under_a_line_share_its_budget() {
+        let state = State::default();
+        let sixteen: String = (0..16).map(|n| format!("%exp_n{n}% ")).collect();
+        let on_request = |exp: &Exp<'_>| {
+            text_of(exp.call(set_placeholders(&sixteen)));
+            Some("x".to_string())
+        };
+        let exp = Exp::new(&state, &on_request);
+        register_as(&exp, Cache::Never);
+
+        resolve(&exp, &sixteen);
+        assert!(
+            exp.asks.get() <= MAX_ASKS_PER_LINE,
+            "{} asks",
+            exp.asks.get()
+        );
+    }
+
+    /// Before, each warning was logged once for the plugin's whole life and
+    /// never named the expansion, so a second one misbehaving stayed silent.
+    #[test]
+    fn warnings_repeat_once_a_minute_for_each_expansion() {
+        let now = Instant::now();
+        assert!(should_warn("test Exp", now));
+        assert!(!should_warn("test Exp", now + Duration::from_secs(59)));
+        assert!(should_warn("test Other", now + Duration::from_secs(59)));
+        assert!(should_warn("test Exp", now + WARN_EVERY));
     }
 
     #[test]

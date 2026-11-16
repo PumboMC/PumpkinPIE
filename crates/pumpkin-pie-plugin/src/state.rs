@@ -9,23 +9,31 @@
 //! the plugin, so [`State::with`] answers [`Busy`] instead.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use pumpkin_pie::expansion::{Expansion, Registry};
 use pumpkin_pie::protocol::{Cache, MAX_MESSAGE_BYTES, ProtocolError};
 
-/// Asks that may wait on an expansion at once.
+/// Expansion asks one top-level line may make, nested calls included.
 ///
-/// The v0.1 API runs one call chain at a time, so this is how deeply an
-/// expansion that calls the provider back can nest. Without a limit, an
-/// expansion whose answer resolves its own placeholder recursed until Pumpkin
-/// stopped the chain at 64 nested calls by trapping the plugin that made the
-/// next one.
-// One counter for the whole plugin: under the concurrent v0.2 API it would also
-// cap asks from unrelated calls, so count per call chain if that ever bites.
-pub(crate) const MAX_ASKS_IN_FLIGHT: usize = 4;
+/// An expansion is asked synchronously, so a misbehaving one could otherwise
+/// ask for placeholders forever. This is the budget for one resolved line, not
+/// one message, so a batch of a thousand lines is not penalised for being
+/// large. Calls nested under the line share it, so an expansion that answers by
+/// resolving more of its own placeholders cannot multiply it.
+pub(crate) const MAX_ASKS_PER_LINE: usize = 16;
+
+/// Asks that the calls nested under one line may have waiting at once.
+///
+/// A call is nested when it comes from an expansion the provider is waiting
+/// on. Pumpkin 0.2.0 to 0.2.2 deliver it within the same call chain and trap the
+/// plugin that makes the 65th nested call, so without a limit an expansion
+/// whose answer resolves its own placeholder recursed until a plugin trapped.
+/// Calls from anyone else are never held to it, so callers waiting side by side
+/// under the concurrent v0.2 API do not refuse each other. A loop through a
+/// third plugin does not look like nesting from here.
+pub(crate) const MAX_NESTED_ASKS: usize = 4;
 
 /// What one expansion's value is cached against.
 type CacheKey = (String, String, String, Option<String>);
@@ -114,9 +122,6 @@ fn cache_insert(
 #[derive(Default)]
 pub(crate) struct State {
     inner: Mutex<Inner>,
-    /// Asks waiting on an expansion right now. Kept outside the lock because an
-    /// ask holds its count across the IPC call; a counter never blocks.
-    asks: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -124,11 +129,23 @@ struct Inner {
     registry: Registry,
     /// Keyed by expansion source, then by viewer and placeholder.
     cache: ExpansionCache,
-    /// Moves on every register and unregister, so an answer that arrives after
+    /// Moves on every register and unregister, so an answer in flight across
     /// one is not cached under a registration it was not given for. One counter
-    /// for every expansion: a change anywhere only costs the answers in flight
-    /// their cache entry.
+    /// for everything: a change anywhere only costs the answers in flight their
+    /// cache entry.
     generation: u64,
+    /// What each call chain has left, by chain id.
+    chains: HashMap<u64, Budget>,
+    last_chain: u64,
+    /// For each expansion being asked, the chain of every ask waiting on it,
+    /// newest last.
+    waiting: HashMap<String, Vec<u64>>,
+}
+
+/// What a top-level line and the calls nested under it have left.
+struct Budget {
+    asks_left: usize,
+    nested_waiting: usize,
 }
 
 /// The state was already locked, which only a call coming back in while the
@@ -136,29 +153,94 @@ struct Inner {
 #[derive(Debug)]
 pub(crate) struct Busy;
 
+/// Why an expansion was not asked.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Refusal {
+    /// The line spent [`MAX_ASKS_PER_LINE`].
+    Budget,
+    /// [`MAX_NESTED_ASKS`] nested asks were already waiting.
+    Nesting,
+}
+
 /// What resolving an expansion placeholder needs next.
-pub(crate) enum Lookup {
+pub(crate) enum Lookup<'a> {
     /// No expansion owns the namespace.
     Unknown,
     /// A value the expansion let the provider reuse.
     Cached(Option<String>),
-    /// Ask the expansion, then hand the answer to [`State::store`].
-    Ask(Pending),
+    /// Leave the placeholder as written.
+    Refused { source: String, why: Refusal },
+    /// Ask the expansion, then hand the answer to [`Pending::store`].
+    Ask(Pending<'a>),
 }
 
-/// An ask about to be made, and what its answer may be cached against.
-pub(crate) struct Pending {
+/// The call chain a line resolves under: a new one for a top-level line, or the
+/// chain of the ask waiting on the caller when an expansion calls back.
+pub(crate) struct Chain<'a> {
+    state: &'a State,
+    id: u64,
+    nested: bool,
+}
+
+impl Drop for Chain<'_> {
+    fn drop(&mut self) {
+        if !self.nested {
+            let _ = self.state.with(|inner| inner.chains.remove(&self.id));
+        }
+    }
+}
+
+/// An ask about to be made, and what its answer may be cached against. It
+/// counts as waiting on its expansion until it is dropped.
+pub(crate) struct Pending<'a> {
+    state: &'a State,
     pub(crate) expansion: Expansion,
     key: CacheKey,
     generation: u64,
+    asked: Instant,
+    chain: u64,
+    nested: bool,
 }
 
-/// One ask in flight, counted until it is dropped.
-pub(crate) struct InFlight<'a>(&'a AtomicUsize);
+impl Pending<'_> {
+    /// Caches the answer if the expansion asked for a TTL and no expansion
+    /// registered or left while it was asked.
+    pub(crate) fn store(self, value: Option<String>) -> Result<(), Busy> {
+        let ttl = self.expansion.ttl_ms();
+        self.state.with(|inner| {
+            if ttl == 0 || inner.generation != self.generation {
+                return;
+            }
+            cache_insert(
+                &mut inner.cache,
+                self.key.clone(),
+                value,
+                Duration::from_millis(ttl),
+                self.asked,
+                MAX_CACHE_ENTRIES,
+                MAX_CACHE_BYTES,
+            );
+        })
+    }
+}
 
-impl Drop for InFlight<'_> {
+impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        let _ = self.state.with(|inner| {
+            if let Some(chains) = inner.waiting.get_mut(&self.expansion.source) {
+                if let Some(index) = chains.iter().rposition(|chain| *chain == self.chain) {
+                    chains.remove(index);
+                }
+                if chains.is_empty() {
+                    inner.waiting.remove(&self.expansion.source);
+                }
+            }
+            if self.nested {
+                if let Some(budget) = inner.chains.get_mut(&self.chain) {
+                    budget.nested_waiting -= 1;
+                }
+            }
+        });
     }
 }
 
@@ -205,14 +287,41 @@ impl State {
         self.with(|inner| inner.registry.all().cloned().collect())
     }
 
+    /// The chain a line from `sender` resolves under; `None` is the server
+    /// itself, such as `/pie`. A call from an expansion the provider is waiting
+    /// on joins the chain of the newest ask waiting on it.
+    pub(crate) fn chain(&self, sender: Option<&str>) -> Chain<'_> {
+        let joined = self.with(|inner| {
+            if let Some(&id) = sender.and_then(|sender| inner.waiting.get(sender)?.last()) {
+                return (id, true);
+            }
+            inner.last_chain += 1;
+            let budget = Budget {
+                asks_left: MAX_ASKS_PER_LINE,
+                nested_waiting: 0,
+            };
+            inner.chains.insert(inner.last_chain, budget);
+            (inner.last_chain, false)
+        });
+        // A busy state refuses every lookup in this chain anyway.
+        let (id, nested) = joined.unwrap_or((0, true));
+        Chain {
+            state: self,
+            id,
+            nested,
+        }
+    }
+
     /// Finds who answers `id` for `viewer`, and whether a cached value will do.
+    /// An ask counts against `chain` until the [`Pending`] it returns is dropped.
     pub(crate) fn lookup(
         &self,
+        chain: &Chain<'_>,
         id: &str,
         viewer: &str,
         argument: Option<&str>,
         now: Instant,
-    ) -> Result<Lookup, Busy> {
+    ) -> Result<Lookup<'_>, Busy> {
         self.with(|inner| {
             let Some(expansion) = inner.registry.owner_of(id).cloned() else {
                 return Lookup::Unknown;
@@ -223,45 +332,38 @@ impl State {
                     return Lookup::Cached(value);
                 }
             }
+            let why = match inner.chains.get_mut(&chain.id) {
+                Some(budget) if budget.asks_left == 0 => Some(Refusal::Budget),
+                Some(budget) if chain.nested && budget.nested_waiting >= MAX_NESTED_ASKS => {
+                    Some(Refusal::Nesting)
+                }
+                Some(budget) => {
+                    budget.asks_left -= 1;
+                    budget.nested_waiting += usize::from(chain.nested);
+                    None
+                }
+                None => Some(Refusal::Budget),
+            };
+            if let Some(why) = why {
+                return Lookup::Refused {
+                    source: expansion.source,
+                    why,
+                };
+            }
+            inner
+                .waiting
+                .entry(expansion.source.clone())
+                .or_default()
+                .push(chain.id);
             Lookup::Ask(Pending {
+                state: self,
                 expansion,
                 key,
                 generation: inner.generation,
+                asked: now,
+                chain: chain.id,
+                nested: chain.nested,
             })
-        })
-    }
-
-    /// Counts an ask in flight, or refuses when [`MAX_ASKS_IN_FLIGHT`] already are.
-    pub(crate) fn begin_ask(&self) -> Option<InFlight<'_>> {
-        if self.asks.fetch_add(1, Ordering::Relaxed) >= MAX_ASKS_IN_FLIGHT {
-            self.asks.fetch_sub(1, Ordering::Relaxed);
-            return None;
-        }
-        Some(InFlight(&self.asks))
-    }
-
-    /// Caches an answer if the expansion asked for a TTL, and only if no
-    /// expansion registered or left while it was being asked.
-    pub(crate) fn store(
-        &self,
-        pending: Pending,
-        value: Option<String>,
-        now: Instant,
-    ) -> Result<(), Busy> {
-        let ttl = pending.expansion.ttl_ms();
-        self.with(|inner| {
-            if ttl == 0 || inner.generation != pending.generation {
-                return;
-            }
-            cache_insert(
-                &mut inner.cache,
-                pending.key,
-                value,
-                Duration::from_millis(ttl),
-                now,
-                MAX_CACHE_ENTRIES,
-                MAX_CACHE_BYTES,
-            );
         })
     }
 
@@ -403,8 +505,8 @@ mod tests {
         assert!(!cache.contains_key(&key));
     }
 
-    /// The v0.2 interleaving, one step at a time: a resolve looks the
-    /// expansion up, the expansion registers again or leaves while the
+    /// The interleaving the v0.2 API allows, one step at a time: a line looks
+    /// the expansion up, the expansion registers again or leaves while the
     /// provider waits for it, and then the answer arrives. Before, the answer
     /// was cached anyway, under a registration it was not given for.
     #[test]
@@ -423,23 +525,49 @@ mod tests {
         for change in [register as fn(&State), unregister] {
             let state = State::default();
             register(&state);
-            let Ok(Lookup::Ask(pending)) = state.lookup("exp_rank", "", None, now) else {
+            let chain = state.chain(None);
+            let Ok(Lookup::Ask(pending)) = state.lookup(&chain, "exp_rank", "", None, now) else {
                 panic!("an uncached placeholder is asked for");
             };
             change(&state);
-            state.store(pending, Some("old".into()), now).unwrap();
+            pending.store(Some("old".into())).unwrap();
             assert!(state.inner.lock().unwrap().cache.is_empty());
         }
     }
 
+    /// Only calls from an expansion the provider is waiting on count as nested,
+    /// and a nested ask stops counting once it is answered.
     #[test]
-    fn asks_in_flight_are_capped_and_released() {
+    fn nested_asks_are_capped_per_chain_and_released() {
+        let now = Instant::now();
         let state = State::default();
-        let asks: Vec<_> = (0..MAX_ASKS_IN_FLIGHT)
-            .map(|_| state.begin_ask().expect("below the cap"))
-            .collect();
-        assert!(state.begin_ask().is_none());
-        drop(asks);
-        assert!(state.begin_ask().is_some());
+        let never = Cache::Never;
+        state
+            .register("Exp", "exp", Vec::new(), never)
+            .unwrap()
+            .unwrap();
+        let ask = |chain: &Chain<'_>| state.lookup(chain, "exp_rank", "", None, now).unwrap();
+
+        let top = state.chain(Some("TabList"));
+        let Lookup::Ask(_waiting) = ask(&top) else {
+            panic!("a top-level line asks");
+        };
+        let nested = state.chain(Some("Exp"));
+        let held: Vec<_> = (0..MAX_NESTED_ASKS).map(|_| ask(&nested)).collect();
+        assert!(held.iter().all(|lookup| matches!(lookup, Lookup::Ask(_))));
+        let refused = ask(&nested);
+        assert!(matches!(
+            refused,
+            Lookup::Refused {
+                why: Refusal::Nesting,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ask(&state.chain(Some("Scoreboard"))),
+            Lookup::Ask(_)
+        ));
+        drop(held);
+        assert!(matches!(ask(&nested), Lookup::Ask(_)));
     }
 }
