@@ -36,6 +36,7 @@ Two things worth knowing before you build:
 | `crates/pumpkin-pie/tests/protocol.rs` | Token, protocol and registry tests |
 | `crates/pumpkin-pie-plugin/src/lib.rs` | The provider crate's entry point |
 | `crates/pumpkin-pie-plugin/src/plugin.rs` | The provider's IPC surface and how it resolves |
+| `crates/pumpkin-pie-plugin/src/plugin/tests.rs` | The provider's tests, with a fake host whose expansion can call back |
 | `crates/pumpkin-pie-plugin/src/state.rs` | The registry and cache, behind the only lock, with no host calls |
 | `crates/pumpkin-pie-plugin/src/command.rs` | `/pie`, and the test pinning its permission node |
 | `crates/pumpkin-pie-testexp/src/lib.rs` | An expansion: registers namespaces and answers |
