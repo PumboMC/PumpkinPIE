@@ -351,3 +351,34 @@ fn batch_limits_aggregate_encoded_size_and_returns_valid_failure() {
     });
     assert!(!decode_response(&encode_response(&oversized)).unwrap().ok);
 }
+
+/// A Scoreboard line with seventeen uncached placeholders is refused at the
+/// seventeenth while another caller waits on an answer. Before, any refusal
+/// kept every answer in flight out of the cache, whoever it was for.
+#[test]
+fn a_refused_line_does_not_stop_other_callers_caching() {
+    let state = State::default();
+    let seventeen: String = (0..=MAX_ASKS_PER_LINE)
+        .map(|n| format!("%exp_s{n}% "))
+        .collect();
+    let first = Cell::new(true);
+    let on_request = |exp: &Exp<'_>| {
+        if first.replace(false) {
+            let line = text_of(handle(
+                exp.state,
+                exp,
+                "Scoreboard",
+                set_placeholders(&seventeen),
+            ));
+            assert!(line.contains("%exp_s16%"), "the seventeenth was refused");
+        }
+        Some("value".to_string())
+    };
+    let exp = Exp::new(&state, &on_request);
+    register_as(&exp, Cache::Ttl { ms: 60_000 });
+
+    assert_eq!(resolve(&exp, "%exp_rank%"), "value");
+    let asks = exp.asks.get();
+    assert_eq!(resolve(&exp, "%exp_rank%"), "value");
+    assert_eq!(exp.asks.get(), asks, "the first answer was cached");
+}

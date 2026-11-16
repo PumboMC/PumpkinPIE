@@ -129,10 +129,9 @@ struct Inner {
     registry: Registry,
     /// Keyed by expansion source, then by viewer and placeholder.
     cache: ExpansionCache,
-    /// Moves on every register, unregister and refused ask, so an answer in
-    /// flight across one is not cached: it may belong to an old registration,
-    /// or hold a placeholder that was left as written. One counter for
-    /// everything: a change anywhere only costs the answers in flight their
+    /// Moves on every register and unregister, so an answer in flight across
+    /// one is not cached under a registration it was not given for. One counter
+    /// for everything: a change anywhere only costs the answers in flight their
     /// cache entry.
     generation: u64,
     /// What each call chain has left, by chain id.
@@ -147,6 +146,9 @@ struct Inner {
 struct Budget {
     asks_left: usize,
     nested_waiting: usize,
+    /// Moves when a nested call in this chain is refused, so the answers in
+    /// flight in it, which may hold that placeholder as written, are not cached.
+    refused: u64,
 }
 
 /// The state was already locked, which only a call coming back in while the
@@ -200,13 +202,14 @@ pub(crate) struct Pending<'a> {
     generation: u64,
     asked: Instant,
     chain: u64,
+    refused: u64,
     nested: bool,
 }
 
 impl Pending<'_> {
     /// Caches the answer if the expansion asked for a TTL and nothing moved
-    /// while it was asked: no registration, no refused ask, and no answer to a
-    /// later ask for the same placeholder.
+    /// while it was asked: no registration, no refused ask in its chain, and no
+    /// answer to a later ask for the same placeholder.
     pub(crate) fn store(self, value: Option<String>) -> Result<(), Busy> {
         let ttl = self.expansion.ttl_ms();
         self.state.with(|inner| {
@@ -214,7 +217,11 @@ impl Pending<'_> {
                 .cache
                 .get(&self.key)
                 .is_some_and(|entry| entry.stored > self.asked);
-            if ttl == 0 || inner.generation != self.generation || newer {
+            let refused = inner
+                .chains
+                .get(&self.chain)
+                .is_some_and(|budget| budget.refused != self.refused);
+            if ttl == 0 || inner.generation != self.generation || newer || refused {
                 return;
             }
             cache_insert(
@@ -305,6 +312,7 @@ impl State {
             let budget = Budget {
                 asks_left: MAX_ASKS_PER_LINE,
                 nested_waiting: 0,
+                refused: 0,
             };
             inner.chains.insert(inner.last_chain, budget);
             (inner.last_chain, false)
@@ -351,13 +359,22 @@ impl State {
                 None => Some(Refusal::Budget),
             };
             if let Some(why) = why {
-                // An answer in flight may now hold this placeholder as written.
-                inner.generation += 1;
+                // Answers in flight in this chain may now hold this placeholder as
+                // written; a top-level refusal has none in its chain.
+                if chain.nested {
+                    if let Some(budget) = inner.chains.get_mut(&chain.id) {
+                        budget.refused += 1;
+                    }
+                }
                 return Lookup::Refused {
                     source: expansion.source,
                     why,
                 };
             }
+            let refused = inner
+                .chains
+                .get(&chain.id)
+                .map_or(0, |budget| budget.refused);
             inner
                 .waiting
                 .entry(expansion.source.clone())
@@ -370,6 +387,7 @@ impl State {
                 generation: inner.generation,
                 asked: now,
                 chain: chain.id,
+                refused,
                 nested: chain.nested,
             })
         })
