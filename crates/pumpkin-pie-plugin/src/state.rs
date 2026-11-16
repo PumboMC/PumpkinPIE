@@ -32,8 +32,19 @@ pub(crate) const MAX_ASKS_PER_LINE: usize = 16;
 /// whose answer resolves its own placeholder recursed until a plugin trapped.
 /// Calls from anyone else are never held to it, so callers waiting side by side
 /// under the concurrent v0.2 API do not refuse each other. A loop through a
-/// third plugin does not look like nesting from here.
+/// third plugin does not look like nesting from here; [`MAX_WAITING_ASKS`]
+/// stops that one.
 pub(crate) const MAX_NESTED_ASKS: usize = 4;
+
+/// Asks that may be waiting on expansions at once, across every chain.
+///
+/// A backstop for loops [`MAX_NESTED_ASKS`] cannot see, such as an expansion
+/// that messages another plugin which resolves the expansion's placeholder
+/// through the provider: every such call starts a fresh chain. Each turn of
+/// that loop takes three of the 64 nested calls Pumpkin allows, so sixteen
+/// asks stop it well inside the limit, and the concurrent v0.2 API rarely has
+/// this many waiting.
+pub(crate) const MAX_WAITING_ASKS: usize = 16;
 
 /// What one expansion's value is cached against.
 type CacheKey = (String, String, String, Option<String>);
@@ -129,10 +140,11 @@ struct Inner {
     registry: Registry,
     /// Keyed by expansion source, then by viewer and placeholder.
     cache: ExpansionCache,
-    /// Moves on every register and unregister, so an answer in flight across
-    /// one is not cached under a registration it was not given for. One counter
-    /// for everything: a change anywhere only costs the answers in flight their
-    /// cache entry.
+    /// Moves on every register and unregister, and when [`MAX_WAITING_ASKS`]
+    /// refuses an ask, so an answer in flight across one is not cached: it may
+    /// belong to an old registration, or hold a placeholder left as written by
+    /// a loop that runs through several chains. One counter for everything: a
+    /// change anywhere only costs the answers in flight their cache entry.
     generation: u64,
     /// What each call chain has left, by chain id.
     chains: HashMap<u64, Budget>,
@@ -163,6 +175,8 @@ pub(crate) enum Refusal {
     Budget,
     /// [`MAX_NESTED_ASKS`] nested asks were already waiting.
     Nesting,
+    /// [`MAX_WAITING_ASKS`] asks were already waiting, across every chain.
+    Backstop,
 }
 
 /// What resolving an expansion placeholder needs next.
@@ -346,7 +360,9 @@ impl State {
                     return Lookup::Cached(value);
                 }
             }
+            let waiting: usize = inner.waiting.values().map(Vec::len).sum();
             let why = match inner.chains.get_mut(&chain.id) {
+                _ if waiting >= MAX_WAITING_ASKS => Some(Refusal::Backstop),
                 Some(budget) if budget.asks_left == 0 => Some(Refusal::Budget),
                 Some(budget) if chain.nested && budget.nested_waiting >= MAX_NESTED_ASKS => {
                     Some(Refusal::Nesting)
@@ -359,9 +375,12 @@ impl State {
                 None => Some(Refusal::Budget),
             };
             if let Some(why) = why {
-                // Answers in flight in this chain may now hold this placeholder as
-                // written; a top-level refusal has none in its chain.
-                if chain.nested {
+                // Answers in flight may now hold this placeholder as written. A
+                // top-level refusal has none in its chain, and the loop the
+                // backstop stops runs through several chains.
+                if matches!(why, Refusal::Backstop) {
+                    inner.generation += 1;
+                } else if chain.nested {
                     if let Some(budget) = inner.chains.get_mut(&chain.id) {
                         budget.refused += 1;
                     }

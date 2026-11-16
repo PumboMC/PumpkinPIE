@@ -31,7 +31,9 @@ use pumpkin_plugin_api::{
 };
 use tracing::{info, warn};
 
-use crate::state::{Busy, Chain, Lookup, MAX_ASKS_PER_LINE, MAX_NESTED_ASKS, Refusal, State};
+use crate::state::{
+    Busy, Chain, Lookup, MAX_ASKS_PER_LINE, MAX_NESTED_ASKS, MAX_WAITING_ASKS, Refusal, State,
+};
 
 /// Version reported by `ping`.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -186,6 +188,10 @@ fn resolve_one(
                     Refusal::Nesting => warn!(
                         "leaving {id} alone: {source} keeps resolving placeholders through \
                          PumpkinPIE while it is being asked, {MAX_NESTED_ASKS} deep"
+                    ),
+                    Refusal::Backstop => warn!(
+                        "leaving {id} alone: {MAX_WAITING_ASKS} asks are already waiting on \
+                         expansions, so {source} is probably in a loop through another plugin"
                     ),
                 }
             }

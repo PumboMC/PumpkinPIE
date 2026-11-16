@@ -382,3 +382,22 @@ fn a_refused_line_does_not_stop_other_callers_caching() {
     assert_eq!(resolve(&exp, "%exp_rank%"), "value");
     assert_eq!(exp.asks.get(), asks, "the first answer was cached");
 }
+
+/// `Exp` answers by messaging a helper plugin, and the helper resolves `Exp`'s
+/// placeholder through the provider. Each of those calls starts a fresh chain,
+/// so before, nothing stopped the loop until Pumpkin trapped a plugin.
+#[test]
+fn a_loop_through_another_plugin_stops_before_the_server_limit() {
+    let state = State::default();
+    let on_request = |exp: &Exp<'_>| {
+        // Exp messages the helper and the helper messages the provider: two hops.
+        let helper = || handle(exp.state, exp, "Helper", set_placeholders("<%exp_loop%>"));
+        Some(text_of(exp.nest(|| exp.nest(helper))))
+    };
+    let exp = Exp::new(&state, &on_request);
+    register_as(&exp, Cache::Never);
+
+    let wrapped = "<".repeat(MAX_WAITING_ASKS) + "%exp_loop%" + &">".repeat(MAX_WAITING_ASKS);
+    assert_eq!(resolve(&exp, "%exp_loop%"), wrapped);
+    assert_eq!(exp.asks.get(), MAX_WAITING_ASKS);
+}
